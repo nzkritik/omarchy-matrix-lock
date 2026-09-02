@@ -1,0 +1,389 @@
+#!/bin/bash
+
+# Draws the matrix rain on the Omarchy lock screen.
+#
+# The lock screen is a WlSessionLock surface owned by the built-in omarchy.lock
+# plugin. A session lock covers every layer-shell surface on the output, so a
+# desktop wallpaper overlay cannot show through it -- the rain has to be drawn
+# inside the lock's own QML. Omarchy's supported route for that is
+# `omarchy plugin clone`, which copies omarchy.lock to <user>.lock and switches
+# the shell over to the copy.
+#
+# LockView.qml is regenerated from the *installed* stock file on every run, so
+# an install picks up whatever Omarchy currently ships rather than freezing a
+# copy taken when this script was written. Service.qml -- every line of the
+# password and fingerprint PAM flow -- is left exactly as cloned.
+#
+#   install      clone omarchy.lock if needed, then draw the rain on it
+#   uninstall    put the stock lock screen back
+#   sync         regenerate the clone against the lock screen you have now
+#   status       report what is installed and what the lock will show
+#   check        exit 0 if the clone is current, 3 if an update left it stale
+#
+# Requires: omarchy 4+ (a Quickshell lock screen; there is no hyprlock).
+
+set -euo pipefail
+
+SELF=$(readlink -f "$0")
+PLUGIN_DIR=${SELF%/bin/*}
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+
+# Fixed, root-owned installation root. Deliberately NOT $OMARCHY_PATH: this
+# names the file whose contents become the user's lock screen, so it must not
+# be redirectable by the environment of whoever invokes the script.
+STOCK_ROOT="/usr/share/omarchy"
+STOCK_DIR="$STOCK_ROOT/shell/plugins/lock"
+STOCK_LOCKVIEW="$STOCK_DIR/LockView.qml"
+
+SOURCE_ID="omarchy.lock"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-matrix-lock"
+
+# Written into the generated LockView.qml so a later run can tell its own
+# output from a file the user has since edited by hand.
+MARKER="nzkritik.matrix-lock:lock"
+
+# Recognised as ours as well: clones generated while this feature still lived in
+# the nzkritik.matrix-rain plugin. The output was identical bar the marker
+# string, so an existing install migrates on the next sync rather than being
+# refused as somebody else's file.
+MARKER_RE='nzkritik\.(matrix-lock|matrix-rain):lock'
+
+# Must match RAIN_FILE in the matrix-rain plugin's Service.qml.
+RAIN_FILE="zz-matrix-rain.png"
+
+fail() {
+  echo "omarchy-matrix-lock: $*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '3,25p' "$SELF" | sed 's|^# \?||'
+}
+
+# --- untrusted-path discipline -----------------------------------------------
+#
+# Everything under $HOME here is a predictable path writable by anything running
+# as this user, so whatever is sitting at one is untrusted input -- and the
+# output of this script becomes a lock screen, so the bar is higher than usual.
+
+# iflag=nofollow refuses a symlink rather than following it somewhere else,
+# nonblock means a planted FIFO returns immediately instead of wedging this
+# process, and count bounds how much a swollen replacement can hand back.
+read_guarded() { # <path> <block-size> <blocks>
+  dd if="$1" iflag=nofollow,nonblock bs="$2" count="$3" 2>/dev/null || true
+}
+
+# A directory we are about to write into must be a real directory, reached
+# without traversing a symlink at the final component.
+require_real_dir() {
+  [[ -L $1 ]] && fail "refusing to use $1: it is a symlink"
+  [[ -d $1 ]] || fail "not a directory: $1"
+  return 0
+}
+
+# A file we are about to replace must be absent, or a plain regular file that
+# is not a symlink. A FIFO, device or link at the target would otherwise
+# redirect or block the write.
+require_plain_target() {
+  [[ -L $1 ]] && fail "refusing to write $1: it is a symlink"
+  [[ -e $1 && ! -f $1 ]] && fail "refusing to write $1: not a regular file"
+  return 0
+}
+
+# Stage a temp file beside the destination -- same directory, so the commit is
+# a rename within one filesystem and cannot fall back to a copy.
+stage_tmp() { # <dest> -> prints tmp path
+  local dir tmp
+  dir=${1%/*}
+  require_real_dir "$dir"
+  require_plain_target "$1"
+  tmp=$(mktemp "$dir/.omarchy-matrix-lock.XXXXXX") || fail "could not stage a write in $dir"
+  chmod 0644 "$tmp"
+  printf '%s' "$tmp"
+}
+
+# Flush, recheck the target, then rename. The recheck narrows the window in
+# which the destination could be swapped for a link between staging and commit;
+# bash cannot hold a directory descriptor across the rename, so this is a bound
+# on the race rather than the elimination of it. The rename itself does not
+# follow a symlink at the destination, so the worst case is a refusal.
+commit_tmp() { # <tmp> <dest>
+  sync "$1" 2>/dev/null || sync
+  require_plain_target "$2"
+  mv -f "$1" "$2" || { rm -f "$1"; fail "could not install $2"; }
+}
+
+discard_tmp() { rm -f "$1" 2>/dev/null || true; }
+
+# --- clone identity ----------------------------------------------------------
+
+# From the password database, not $USER: the environment is mutable by the
+# caller and this becomes a directory name under ~/.config/omarchy/plugins.
+CLONE_USER=$(id -un)
+[[ $CLONE_USER =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] ||
+  fail "refusing implausible user name for the clone id: $CLONE_USER"
+CLONE_ID="$CLONE_USER.lock"
+CLONE_DIR="$PLUGINS_DIR/$CLONE_ID"
+
+# --- the patch ---------------------------------------------------------------
+
+# Applied to the stock LockView on stdin. Every anchor must match exactly once:
+# if Omarchy reworks LockView.qml the edit is refused outright rather than
+# half-applied to a lock screen.
+PATCH_PY=$(cat <<'PYEOF'
+import os, sys
+
+s = sys.stdin.read()
+if not s.strip():
+    sys.exit("stock LockView.qml was empty or unreadable")
+
+rain_file = os.environ["RAIN_FILE"]
+marker = os.environ["MARKER"]
+
+
+def sub(old, new):
+    global s
+    if s.count(old) != 1:
+        sys.exit("anchor matched %d times, expected 1:\n%s"
+                 % (s.count(old), old.strip()[:120]))
+    s = s.replace(old, new)
+
+
+sub(
+    "  property bool loadBackground: true\n",
+    "  property bool loadBackground: true\n"
+    "  // Generated by " + marker + " -- edits here are overwritten on sync.\n"
+    "  //\n"
+    "  // The background picker can only list stills, so the rain is represented\n"
+    "  // on disk by a preview PNG under this name and drawn live wherever that\n"
+    "  // file is the selection. Matching the same name here is what keeps the\n"
+    "  // lock screen in step with the desktop with no separate setting, and what\n"
+    "  // leaves the stock blurred still in place for every other wallpaper. If\n"
+    "  // the rain plugin is removed this simply stays false.\n"
+    '  readonly property bool rainActive: String(backgroundPath).split("/").pop() === "'
+    + rain_file + '"\n',
+)
+
+# Nothing decodes or blurs the stand-in still while the rain covers it.
+sub(
+    '      source: root.loadBackground ? root.fileUrl(root.backgroundPath) : ""',
+    '      source: root.loadBackground && !root.rainActive ? root.fileUrl(root.backgroundPath) : ""',
+)
+sub(
+    "      blurEnabled: root.loadBackground && wallpaper.status === Image.Ready",
+    "      visible: !root.rainActive\n"
+    "      blurEnabled: root.loadBackground && !root.rainActive && wallpaper.status === Image.Ready",
+)
+
+# Above the wallpaper, below the click-to-wake area and the password field.
+mouse = "    MouseArea {\n      anchors.fill: parent\n      hoverEnabled: true\n"
+sub(
+    mouse,
+    "    // Loaded only while the rain is the selected background, so an ordinary\n"
+    "    // wallpaper leaves the lock screen bit-for-bit stock.\n"
+    "    Loader {\n"
+    "      id: rainLoader\n"
+    "      anchors.fill: parent\n"
+    "      active: root.rainActive\n"
+    '      source: "MatrixRain.qml"\n'
+    "    }\n"
+    "\n"
+    "    // loadBackground is the lock's own \"is anyone looking at this\" flag --\n"
+    "    // root.locked when locked, previewVisible in the preview. Reusing it\n"
+    "    // stops the rain animating behind a display the idle timer has blanked.\n"
+    "    Binding {\n"
+    "      target: rainLoader.item\n"
+    '      property: "playing"\n'
+    "      value: root.loadBackground\n"
+    "      when: rainLoader.item !== null\n"
+    "      restoreMode: Binding.RestoreNone\n"
+    "    }\n"
+    "\n"
+    + mouse,
+)
+
+sys.stdout.write(s)
+PYEOF
+)
+
+# The stock file is read here rather than opened by the patcher, so the bound
+# and the no-follow apply to it too. 1MB is ~50x the real file.
+generate_lockview() {
+  [[ -f $STOCK_LOCKVIEW && ! -L $STOCK_LOCKVIEW ]] ||
+    fail "stock lock view is missing or not a regular file: $STOCK_LOCKVIEW"
+  read_guarded "$STOCK_LOCKVIEW" 4096 256 |
+    RAIN_FILE="$RAIN_FILE" MARKER="$MARKER" python3 -c "$PATCH_PY"
+}
+
+# Identifies the stock lock screen this clone was generated from, so a later
+# Omarchy update can be noticed.
+stock_id() {
+  read_guarded "$STOCK_LOCKVIEW" 4096 256 | sha256sum | cut -d' ' -f1
+}
+
+STAMP="$STATE_DIR/stock-lockview.sha256"
+
+require_stock() {
+  [[ -d $STOCK_DIR ]] || fail "stock lock plugin not found at $STOCK_DIR (needs Omarchy 4+)"
+  [[ -f $STOCK_LOCKVIEW ]] || fail "stock lock view not found at $STOCK_LOCKVIEW (needs Omarchy 4+)"
+  [[ -f $PLUGIN_DIR/MatrixRain.qml ]] || fail "MatrixRain.qml missing from $PLUGIN_DIR"
+}
+
+# True when the clone's LockView is ours, so regenerating it loses nothing.
+clone_is_generated() {
+  [[ -f $CLONE_DIR/LockView.qml && ! -L $CLONE_DIR/LockView.qml ]] || return 1
+  read_guarded "$CLONE_DIR/LockView.qml" 4096 256 | grep -qE "$MARKER_RE"
+}
+
+write_lockview() {
+  require_real_dir "$CLONE_DIR"
+
+  # Generated to a staged file rather than through $(...), which would eat the
+  # trailing newline, and so a failed generate leaves the existing lock screen
+  # untouched.
+  local tmp
+  tmp=$(stage_tmp "$CLONE_DIR/LockView.qml")
+  if ! generate_lockview >"$tmp"; then
+    discard_tmp "$tmp"
+    fail "could not patch LockView.qml -- this Omarchy's lock screen differs from what this plugin expects. Please report it at github.com/nzkritik/omarchy-matrix-lock."
+  fi
+  commit_tmp "$tmp" "$CLONE_DIR/LockView.qml"
+
+  tmp=$(stage_tmp "$CLONE_DIR/MatrixRain.qml")
+  if ! cat "$PLUGIN_DIR/MatrixRain.qml" >"$tmp"; then
+    discard_tmp "$tmp"
+    fail "could not copy MatrixRain.qml into $CLONE_DIR"
+  fi
+  commit_tmp "$tmp" "$CLONE_DIR/MatrixRain.qml"
+
+  write_stamp
+}
+
+write_stamp() {
+  mkdir -p "$STATE_DIR"
+  require_real_dir "$STATE_DIR"
+  local tmp
+  tmp=$(stage_tmp "$STAMP")
+  if ! stock_id >"$tmp"; then
+    discard_tmp "$tmp"
+    fail "could not record the stock lock screen version"
+  fi
+  commit_tmp "$tmp" "$STAMP"
+}
+
+# 0 current, 3 stale, 1 not installed.
+clone_state() {
+  [[ -d $CLONE_DIR ]] || return 1
+  clone_is_generated || return 1
+  local recorded current
+  recorded=$(read_guarded "$STAMP" 1 128 | head -n1)
+  current=$(stock_id)
+  [[ -n $recorded && $recorded == "$current" ]] || return 3
+  cmp -s "$CLONE_DIR/MatrixRain.qml" "$PLUGIN_DIR/MatrixRain.qml" || return 3
+  return 0
+}
+
+cmd_install() {
+  require_stock
+
+  if [[ ! -d $CLONE_DIR ]]; then
+    omarchy-plugin-clone "$SOURCE_ID" >/dev/null ||
+      fail "could not clone $SOURCE_ID"
+    echo "Cloned $SOURCE_ID to $CLONE_ID"
+  elif ! clone_is_generated && ! cmp -s "$CLONE_DIR/LockView.qml" "$STOCK_LOCKVIEW"; then
+    fail "$CLONE_DIR/LockView.qml has your own edits; back them up and delete the file to continue"
+  fi
+
+  write_lockview
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+
+  echo "Matrix rain installed on the lock screen ($CLONE_ID)."
+  echo "Run 'omarchy restart shell' to load it, then preview with:"
+  echo "  omarchy-shell lock preview"
+}
+
+cmd_sync() {
+  require_stock
+  [[ -d $CLONE_DIR ]] || fail "not installed; run: omarchy-matrix-lock install"
+  clone_is_generated ||
+    fail "$CLONE_DIR/LockView.qml was not generated by this plugin; refusing to overwrite it"
+
+  write_lockview
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  echo "Refreshed $CLONE_ID against the installed lock screen. Run 'omarchy restart shell'."
+}
+
+cmd_uninstall() {
+  [[ -d $CLONE_DIR ]] || { echo "Not installed; nothing to do."; return 0; }
+  clone_is_generated ||
+    fail "$CLONE_DIR was not set up by this plugin; remove it yourself with: omarchy plugin remove $CLONE_ID"
+
+  # Anything beyond what the clone and this script create is the user's, so the
+  # whole clone is only removed when nothing of theirs would go with it.
+  local extra
+  extra=$(find "$CLONE_DIR" -mindepth 1 -maxdepth 1 \
+    ! -name LockView.qml ! -name MatrixRain.qml ! -name Service.qml ! -name manifest.json)
+
+  if [[ -z $extra ]] && cmp -s "$CLONE_DIR/Service.qml" "$STOCK_DIR/Service.qml"; then
+    omarchy-plugin-remove "$CLONE_ID" --yes >/dev/null ||
+      fail "could not remove $CLONE_ID"
+    echo "Removed $CLONE_ID; the built-in lock screen is back."
+  else
+    require_real_dir "$CLONE_DIR"
+    local tmp
+    tmp=$(stage_tmp "$CLONE_DIR/LockView.qml")
+    if ! read_guarded "$STOCK_LOCKVIEW" 4096 256 >"$tmp"; then
+      discard_tmp "$tmp"
+      fail "could not restore the stock LockView.qml"
+    fi
+    commit_tmp "$tmp" "$CLONE_DIR/LockView.qml"
+    rm -f "$CLONE_DIR/MatrixRain.qml"
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    echo "Reverted the rain from $CLONE_ID and kept your other changes to it."
+  fi
+  rm -f "$STAMP" 2>/dev/null || true
+  echo "Run 'omarchy restart shell' to apply."
+}
+
+cmd_status() {
+  local state=0
+  clone_state || state=$?
+
+  case $state in
+  0) echo "lock rain:  installed on $CLONE_ID" ;;
+  3) echo "lock rain:  installed on $CLONE_ID (stale -- run: omarchy-matrix-lock sync)" ;;
+  *)
+    if [[ ! -d $CLONE_DIR ]]; then
+      echo "lock rain:  not installed"
+    else
+      echo "lock rain:  $CLONE_ID exists but was not set up by this plugin"
+    fi
+    ;;
+  esac
+
+  local current
+  current=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null || true)
+  if [[ ${current##*/} == "$RAIN_FILE" ]]; then
+    echo "background: matrix rain selected, so the lock screen shows it"
+  else
+    echo "background: ${current##*/} -- the lock screen shows the stock blurred still"
+  fi
+}
+
+# Quiet, for the service to poll.
+cmd_check() {
+  local state=0
+  clone_state || state=$?
+  exit $state
+}
+
+case "${1:-}" in
+install) cmd_install ;;
+uninstall | remove) cmd_uninstall ;;
+sync) cmd_sync ;;
+status) cmd_status ;;
+check) cmd_check ;;
+-h | --help | "") usage ;;
+*) fail "unknown command: $1 (try --help)" ;;
+esac
