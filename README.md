@@ -6,9 +6,27 @@ Omarchy update has left it out of date.
 
 ![Matrix rain behind the Omarchy lock screen's password field](preview.png)
 
-It follows your desktop: rain while the rain is your selected background, the
-stock blurred still for any other wallpaper. Preview it without locking yourself
-out with `omarchy-shell lock preview`.
+Preview it without locking yourself out with `omarchy-shell lock preview`.
+
+## Requires Matrix Rain as your wallpaper
+
+This plugin is a companion to
+[Matrix Rain](https://github.com/nzkritik/omarchy-matrix-rain), and the lock
+screen follows your desktop:
+
+| Your wallpaper | The lock screen shows |
+| --- | --- |
+| Matrix Rain | the rain, in your theme's accent colour |
+| anything else | Omarchy's stock blurred wallpaper, unchanged |
+
+So install Matrix Rain and pick it in the background picker (Style ›
+Background), or the lock screen will look exactly as it does without this
+plugin. `omarchy-matrix-lock status` tells you which of the two the lock will
+show right now.
+
+Stock Omarchy has no separate setting for the lock screen. It takes its colours
+from your theme and its background from your wallpaper, and following the
+wallpaper keeps it that way.
 
 ## Install
 
@@ -19,9 +37,7 @@ omarchy-matrix-lock install
 omarchy restart shell
 ```
 
-The rain appears on the lock screen once
-[Matrix Rain](https://github.com/nzkritik/omarchy-matrix-rain) is your selected
-wallpaper.
+Then select Matrix Rain as your wallpaper (see above).
 
 ```bash
 omarchy-matrix-lock status      # what is installed, and what the lock will show
@@ -52,10 +68,11 @@ Qt 6 only loads precompiled shaders, so `rain.frag.qsb` (`rain.frag` built by
 Qt's `qsb`) is committed alongside its source. `tools/build-shaders.sh` rebuilds
 it byte for byte, so anyone can check the binary matches the source.
 
-The rain is self-contained: the `MatrixRain*.qml` files and the shader ship
-here and are copied into the clone. It works with or without the desktop
-wallpaper plugin installed, and removing that plugin can never break your lock
-screen.
+The renderer is self-contained: the `MatrixRain*.qml` files and the shader ship
+here and are copied into the clone, rather than loaded from the Matrix Rain
+plugin. Matrix Rain decides *whether* the lock shows rain, never *how* it is
+drawn, so updating or removing it can never break your lock screen. Without it,
+the lock screen just stays stock.
 
 ## What it does to your system
 
