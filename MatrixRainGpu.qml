@@ -88,9 +88,14 @@ Item {
     id: atlas
     sourceItem: atlasRow
     hideSource: true
-    // Rendered once. Rendering it at device resolution keeps the glyphs sharp
-    // on a scaled display.
-    live: false
+    // Rendered at device resolution so the glyphs stay sharp on a scaled
+    // display. Live, even though the text never changes: a static source is
+    // only re-rendered when needed, and one of those times is a new scene
+    // graph. Hiding a surface releases its GPU resources, so with `live:
+    // false` the atlas captured before was simply gone, and the shader drew
+    // background only. That happened on every lock-screen preview after the
+    // first.
+    live: true
     textureSize: Qt.size(atlasRow.width * Screen.devicePixelRatio, atlasRow.height * Screen.devicePixelRatio)
     smooth: true
     visible: false

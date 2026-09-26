@@ -4,6 +4,8 @@ Draws the [Matrix Rain](https://github.com/nzkritik/omarchy-matrix-rain) effect
 on the [Omarchy](https://omarchy.org/) lock screen, and tells you when an
 Omarchy update has left it out of date.
 
+![Matrix rain behind the Omarchy lock screen's password field](preview.png)
+
 It follows your desktop: rain while the rain is your selected background, the
 stock blurred still for any other wallpaper. Preview it without locking yourself
 out with `omarchy-shell lock preview`.
@@ -11,9 +13,15 @@ out with `omarchy-shell lock preview`.
 ## Install
 
 ```bash
+omarchy plugin add https://github.com/nzkritik/omarchy-matrix-lock --enable
+ln -s ~/.config/omarchy/plugins/nzkritik.matrix-lock/bin/omarchy-matrix-lock ~/.local/bin/
 omarchy-matrix-lock install
 omarchy restart shell
 ```
+
+The rain appears on the lock screen once
+[Matrix Rain](https://github.com/nzkritik/omarchy-matrix-rain) is your selected
+wallpaper.
 
 ```bash
 omarchy-matrix-lock status      # what is installed, and what the lock will show
@@ -22,18 +30,32 @@ omarchy-matrix-lock uninstall   # put the stock lock screen back
 omarchy-matrix-lock check       # quiet; exit 0 current, 3 stale, 1 not installed
 ```
 
-The rain is drawn by one GPU fragment shader, about 2% of a CPU core at
-1920x1080 against roughly 25% for the text-item version before it. Without a
-GPU scene graph, or if the shader cannot load, it falls back to that text-item
-renderer on its own. `rain.frag.qsb` is `rain.frag` compiled for Qt 6, and
-`tools/build-shaders.sh` rebuilds it byte for byte.
+**Upgrading from 1.0:** run `omarchy-matrix-lock sync` after updating (the
+plugin reminds you), because the clone needs the new renderer files copied in.
 
-**Upgrading from 1.0:** run `omarchy-matrix-lock sync` (the plugin will remind
-you), because the clone needs the new renderer files copied in.
+## GPU rendering, with a CPU fallback
 
-The rain itself is self-contained — the `MatrixRain*.qml` files and the shader ship here
-and are copied into the clone — so this works with or without the desktop wallpaper plugin
-installed, and removing that plugin can never break your lock screen.
+The rain is drawn by one fragment shader. Every column is a function of time
+worked out on the GPU, over a texture of the glyphs rendered once from ordinary
+text, so the CPU only advances a clock, 30 times a second.
+
+| Renderer | File | CPU at 1920x1080 | Used when |
+| --- | --- | --- | --- |
+| GPU | `MatrixRainGpu.qml`, `rain.frag` | about 2% of a core | the scene graph is hardware accelerated (normally) |
+| CPU | `MatrixRainCpu.qml` | about 25% of a core | a software scene graph, or the shader fails to load |
+
+`MatrixRain.qml` picks between them by itself. Both look the same, and a fall
+back is logged once to the journal as
+`matrix rain: shader unavailable, falling back to the CPU renderer`.
+
+Qt 6 only loads precompiled shaders, so `rain.frag.qsb` (`rain.frag` built by
+Qt's `qsb`) is committed alongside its source. `tools/build-shaders.sh` rebuilds
+it byte for byte, so anyone can check the binary matches the source.
+
+The rain is self-contained: the `MatrixRain*.qml` files and the shader ship
+here and are copied into the clone. It works with or without the desktop
+wallpaper plugin installed, and removing that plugin can never break your lock
+screen.
 
 ## What it does to your system
 
@@ -82,6 +104,7 @@ more care than a wallpaper would need.
 omarchy-matrix-lock uninstall
 omarchy plugin remove nzkritik.matrix-lock --yes
 rm -rf ~/.local/state/omarchy-matrix-lock
+rm -f ~/.local/bin/omarchy-matrix-lock
 ```
 
 Take the lock screen off *first*, while this plugin is still around to do it.
