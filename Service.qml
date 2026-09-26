@@ -54,7 +54,7 @@ Item {
     id: notifyProc
     command: ["notify-send", "--app-name=Matrix Lock", "--icon=system-lock-screen",
       "Lock screen is out of date",
-      "Omarchy updated the lock screen since your matrix clone was made. Run: omarchy-matrix-lock sync"]
+      "An Omarchy or Matrix Lock update changed the lock screen since your matrix clone was made. Run: omarchy-matrix-lock sync"]
   }
 
   Process {

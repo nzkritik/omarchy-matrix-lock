@@ -49,6 +49,11 @@ MARKER="nzkritik.matrix-lock:lock"
 # refused as somebody else's file.
 MARKER_RE='nzkritik\.(matrix-lock|matrix-rain):lock'
 
+# Everything the rain needs, copied verbatim into the clone. MatrixRain.qml is
+# the entry the patched LockView loads; it picks the GPU renderer and falls back
+# to the CPU one, so all of them travel together.
+RAIN_FILES=(MatrixRain.qml MatrixRainGpu.qml MatrixRainCpu.qml rain.frag.qsb)
+
 # Must match RAIN_FILE in the matrix-rain plugin's Service.qml.
 RAIN_FILE="zz-matrix-rain.png"
 
@@ -227,7 +232,10 @@ STAMP="$STATE_DIR/stock-lockview.sha256"
 require_stock() {
   [[ -d $STOCK_DIR ]] || fail "stock lock plugin not found at $STOCK_DIR (needs Omarchy 4+)"
   [[ -f $STOCK_LOCKVIEW ]] || fail "stock lock view not found at $STOCK_LOCKVIEW (needs Omarchy 4+)"
-  [[ -f $PLUGIN_DIR/MatrixRain.qml ]] || fail "MatrixRain.qml missing from $PLUGIN_DIR"
+  local f
+  for f in "${RAIN_FILES[@]}"; do
+    [[ -f $PLUGIN_DIR/$f ]] || fail "$f missing from $PLUGIN_DIR"
+  done
 }
 
 # True when the clone's LockView is ours, so regenerating it loses nothing.
@@ -250,12 +258,15 @@ write_lockview() {
   fi
   commit_tmp "$tmp" "$CLONE_DIR/LockView.qml"
 
-  tmp=$(stage_tmp "$CLONE_DIR/MatrixRain.qml")
-  if ! cat "$PLUGIN_DIR/MatrixRain.qml" >"$tmp"; then
-    discard_tmp "$tmp"
-    fail "could not copy MatrixRain.qml into $CLONE_DIR"
-  fi
-  commit_tmp "$tmp" "$CLONE_DIR/MatrixRain.qml"
+  local f
+  for f in "${RAIN_FILES[@]}"; do
+    tmp=$(stage_tmp "$CLONE_DIR/$f")
+    if ! cat "$PLUGIN_DIR/$f" >"$tmp"; then
+      discard_tmp "$tmp"
+      fail "could not copy $f into $CLONE_DIR"
+    fi
+    commit_tmp "$tmp" "$CLONE_DIR/$f"
+  done
 
   write_stamp
 }
@@ -280,7 +291,12 @@ clone_state() {
   recorded=$(read_guarded "$STAMP" 1 128 | head -n1)
   current=$(stock_id)
   [[ -n $recorded && $recorded == "$current" ]] || return 3
-  cmp -s "$CLONE_DIR/MatrixRain.qml" "$PLUGIN_DIR/MatrixRain.qml" || return 3
+  # A clone made by an older version of this plugin lacks some of these, which
+  # reads as stale too -- and `sync` is exactly what brings it up to date.
+  local f
+  for f in "${RAIN_FILES[@]}"; do
+    cmp -s "$CLONE_DIR/$f" "$PLUGIN_DIR/$f" || return 3
+  done
   return 0
 }
 
@@ -321,9 +337,10 @@ cmd_uninstall() {
 
   # Anything beyond what the clone and this script create is the user's, so the
   # whole clone is only removed when nothing of theirs would go with it.
-  local extra
-  extra=$(find "$CLONE_DIR" -mindepth 1 -maxdepth 1 \
-    ! -name LockView.qml ! -name MatrixRain.qml ! -name Service.qml ! -name manifest.json)
+  local extra f
+  local ours=(! -name LockView.qml ! -name Service.qml ! -name manifest.json)
+  for f in "${RAIN_FILES[@]}"; do ours+=(! -name "$f"); done
+  extra=$(find "$CLONE_DIR" -mindepth 1 -maxdepth 1 "${ours[@]}")
 
   if [[ -z $extra ]] && cmp -s "$CLONE_DIR/Service.qml" "$STOCK_DIR/Service.qml"; then
     omarchy-plugin-remove "$CLONE_ID" --yes >/dev/null ||
@@ -338,7 +355,7 @@ cmd_uninstall() {
       fail "could not restore the stock LockView.qml"
     fi
     commit_tmp "$tmp" "$CLONE_DIR/LockView.qml"
-    rm -f "$CLONE_DIR/MatrixRain.qml"
+    for f in "${RAIN_FILES[@]}"; do rm -f "$CLONE_DIR/$f"; done
     omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
     echo "Reverted the rain from $CLONE_ID and kept your other changes to it."
   fi

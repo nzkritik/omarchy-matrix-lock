@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "nzkritik.matrix-lock",
   "name": "Matrix Lock",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "nzkritik",
   "description": "Draws the matrix rain on the Omarchy lock screen, and tells you when an Omarchy update has left the clone stale.",
   "kinds": [
