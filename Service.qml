@@ -13,7 +13,8 @@
 // from against the one installed now; the shell restarts on update, so a stale
 // clone is reported at exactly the moment it becomes stale.
 //
-// Nothing here writes anything, and nothing runs unless the shell starts or an
+// Nothing here writes anything except, once, the marker that the setup hint was
+// shown (through the script), and nothing runs unless the shell starts or an
 // IPC call arrives.
 
 import Quickshell
@@ -30,6 +31,11 @@ Item {
   }
   readonly property string bin: pluginDir + "bin/omarchy-matrix-lock"
 
+  // Every child gets tools from the two root-owned directories only, and no
+  // BASH_ENV/ENV for bash to source first; the script pins PATH too, but only
+  // once it is running. Tools are named by full path for the same reason.
+  readonly property var childEnv: ({ PATH: "/usr/share/omarchy/bin:/usr/bin", BASH_ENV: null, ENV: null })
+
   // 0 current, 1 not installed, 3 installed but stale. -1 until first checked.
   property int state: -1
   readonly property bool stale: state === 3
@@ -40,26 +46,52 @@ Item {
 
   Process {
     id: checkProc
-    command: ["bash", "-c", 'exec "$0" check', root.bin]
+    command: ["/usr/bin/bash", "-c", 'exec "$0" check', root.bin]
+    environment: root.childEnv
     onExited: function (exitCode) {
       root.state = exitCode
       // Only ever on a transition into stale, so re-checking on demand does
       // not re-notify. A shell restart is a fresh process and does notify,
       // which is the point: that is the restart that followed the update.
       if (exitCode === 3) notifyProc.running = true
+      // Not set up yet: ask the script whether to say how. It answers yes
+      // exactly once, ever, so this never nags.
+      else if (exitCode === 1) noticeProc.running = true
     }
   }
 
   Process {
     id: notifyProc
-    command: ["notify-send", "--app-name=Matrix Lock", "--icon=system-lock-screen",
+    environment: root.childEnv
+    command: ["/usr/bin/notify-send", "--app-name=Matrix Lock", "--icon=system-lock-screen",
       "Lock screen is out of date",
       "An Omarchy or Matrix Lock update changed the lock screen since your matrix clone was made. Run: omarchy-matrix-lock sync"]
   }
 
   Process {
+    id: noticeProc
+    command: ["/usr/bin/bash", "-c", 'exec "$0" notice', root.bin]
+    environment: root.childEnv
+    onExited: function (exitCode) {
+      if (exitCode === 0) setupProc.running = true
+    }
+  }
+
+  // Adding the plugin changes nothing on its own: the lock screen is only
+  // cloned and patched when you run install, so it never happens without
+  // your say-so. This is the one time the plugin says so.
+  Process {
+    id: setupProc
+    environment: root.childEnv
+    command: ["/usr/bin/notify-send", "--app-name=Matrix Lock", "--icon=system-lock-screen",
+      "Matrix Lock is not set up yet",
+      "To put the rain on your lock screen, run:\n" + root.bin + " install\nthen: omarchy restart shell"]
+  }
+
+  Process {
     id: statusProc
-    command: ["bash", "-c", 'exec "$0" status', root.bin]
+    command: ["/usr/bin/bash", "-c", 'exec "$0" status', root.bin]
+    environment: root.childEnv
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
   }
 

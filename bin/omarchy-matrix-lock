@@ -19,10 +19,18 @@
 #   sync         regenerate the clone against the lock screen you have now
 #   status       report what is installed and what the lock will show
 #   check        exit 0 if the clone is current, 3 if an update left it stale
+#   notice       used by the plugin: exit 0 once, the first time it finds the
+#                lock screen not set up, so it can say how; 1 otherwise
 #
 # Requires: omarchy 4+ (a Quickshell lock screen; there is no hyprlock).
 
 set -euo pipefail
+
+# Every tool this uses is part of Omarchy or the base system, so resolve them
+# from those two root-owned directories only, never from an inherited PATH. The
+# output of this script becomes the lock screen.
+PATH=/usr/share/omarchy/bin:/usr/bin
+export PATH
 
 SELF=$(readlink -f "$0")
 PLUGIN_DIR=${SELF%/bin/*}
@@ -389,6 +397,23 @@ cmd_status() {
 }
 
 # Quiet, for the service to poll.
+# Shown once: a plugin added through `omarchy plugin add` does nothing to the
+# lock screen until `install` is run, and would otherwise say nothing about it.
+# The marker is written like everything else here (staged, then renamed) and is
+# kept by uninstall, so choosing not to set up is never nagged about.
+cmd_notice() {
+  local state=0 marker="$STATE_DIR/setup-hint-shown"
+  clone_state || state=$?
+  [[ $state == 1 ]] || exit 1
+  [[ -e $marker || -L $marker ]] && exit 1
+  mkdir -p "$STATE_DIR"
+  require_real_dir "$STATE_DIR"
+  local tmp
+  tmp=$(stage_tmp "$marker")
+  commit_tmp "$tmp" "$marker"
+  exit 0
+}
+
 cmd_check() {
   local state=0
   clone_state || state=$?
@@ -401,6 +426,7 @@ uninstall | remove) cmd_uninstall ;;
 sync) cmd_sync ;;
 status) cmd_status ;;
 check) cmd_check ;;
+notice) cmd_notice ;;
 -h | --help | "") usage ;;
 *) fail "unknown command: $1 (try --help)" ;;
 esac

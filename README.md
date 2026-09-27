@@ -39,6 +39,10 @@ omarchy restart shell
 
 Then select Matrix Rain as your wallpaper (see above).
 
+Adding the plugin changes nothing by itself: your lock screen is only cloned
+and patched when you run `install`. If you add it and skip that step, it tells
+you once, in a notification with the exact command, and never again.
+
 ```bash
 omarchy-matrix-lock status      # what is installed, and what the lock will show
 omarchy-matrix-lock sync        # after an Omarchy update, or after updating this plugin
@@ -106,6 +110,10 @@ more care than a wallpaper would need.
 - The stock `LockView.qml` is resolved from a fixed `/usr/share/omarchy`, never
   from `$OMARCHY_PATH` — the environment must not be able to redirect the file
   whose contents become your lock screen.
+- Every tool is resolved from `/usr/share/omarchy/bin` and `/usr/bin` only.
+  The script pins `PATH` to those two root-owned directories, and the plugin
+  starts it with that `PATH`, by full path, and without `BASH_ENV`, so nothing
+  earlier on an inherited `PATH` can stand in for a tool.
 - The clone id comes from `id -un`, not `$USER`, and is validated as a single
   safe path component before it is used as a directory name.
 - Every read of a user-writable path goes through one bounded, no-follow,
