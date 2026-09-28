@@ -508,12 +508,8 @@ generate_service() { # <hide-seconds> <off-seconds>
       python3 -c "$PATCH_COMMON_PY"$'\n'"$SERVICE_PY"
 }
 
-# Identifies the stock lock screen this clone was generated from, so a later
-# Omarchy update can be noticed.
-stock_id() {
-  { read_stock "$STOCK_LOCKVIEW"; read_stock "$STOCK_SERVICE"; } | sha256sum | cut -d' ' -f1
-}
-
+# Left by 1.2 and earlier, which recorded a hash of the stock LockView.qml
+# alone. Nothing reads it now; uninstall still removes it.
 STAMP="$STATE_DIR/stock-lockview.sha256"
 
 require_stock() {
@@ -584,35 +580,37 @@ write_clone() {
   for f in "${RAIN_FILES[@]}"; do
     write_file "$CLONE_DIR/$f" <"$PLUGIN_DIR/$f" || fail "could not copy $f into $CLONE_DIR"
   done
-
-  write_stamp
-}
-
-write_stamp() {
-  mkdir -p "$STATE_DIR"
-  require_real_dir "$STATE_DIR"
-  local tmp
-  tmp=$(stage_tmp "$STAMP")
-  if ! stock_id >"$tmp"; then
-    discard_tmp "$tmp"
-    fail "could not record the stock lock screen version"
-  fi
-  commit_tmp "$tmp" "$STAMP"
 }
 
 # 0 current, 3 stale, 1 not installed.
+#
+# Current means byte-identical to what `sync` would write right now: both lock
+# files are regenerated from the stock files installed at this moment, with the
+# settings the clone already carries, and compared with the clone itself. So an
+# Omarchy update to either stock file -- Service.qml holds the PAM flow -- a
+# hand edit, or a half-finished sync all read as stale. Nothing is recorded
+# between runs for this to go wrong against.
 clone_state() {
   [[ -d $CLONE_DIR ]] || return 1
   clone_is_generated || return 1
-  local recorded current
-  recorded=$(read_guarded "$STAMP" 1 128 | head -n1)
-  current=$(stock_id)
-  [[ -n $recorded && $recorded == "$current" ]] || return 3
-  # A clone made by an older version of this plugin lacks some of these, or
-  # has a stock Service.qml, which reads as stale too -- and `sync` is exactly
-  # what brings it up to date.
-  read_guarded "$CLONE_DIR/Service.qml" 4096 256 | grep -qF "$SERVICE_MARKER" || return 3
+
   local f
+  for f in LockView.qml Service.qml; do
+    [[ -f $CLONE_DIR/$f && ! -L $CLONE_DIR/$f ]] || return 3
+  done
+
+  # A 1.2 or earlier clone has a stock Service.qml with no settings in it.
+  local applied hide off
+  applied=$(applied_settings)
+  [[ -n $applied ]] || return 3
+  read -r hide off <<<"$applied"
+
+  # A stock file this plugin can no longer patch generates nothing, which
+  # compares unequal: stale, and `sync` then says why.
+  cmp -s <(generate_lockview 2>/dev/null) <(read_guarded "$CLONE_DIR/LockView.qml" 4096 256) || return 3
+  cmp -s <(generate_service "$hide" "$off" 2>/dev/null) <(read_guarded "$CLONE_DIR/Service.qml" 4096 256) || return 3
+
+  # And the rain files must be the ones this version of the plugin ships.
   for f in "${RAIN_FILES[@]}"; do
     cmp -s "$CLONE_DIR/$f" "$PLUGIN_DIR/$f" || return 3
   done

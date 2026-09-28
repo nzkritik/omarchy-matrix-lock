@@ -118,9 +118,12 @@ Two things to know before you install it:
 
 - **The clone stops tracking upstream.** Your lock screen will not pick up fixes
   to `omarchy.lock`, security ones included, until you run `sync`. This is why
-  the plugin ships a service at all: it records which stock lock screen the
-  clone was generated from, and notifies you on the next shell start after it
-  changes. That is the notification you get after `omarchy update`.
+  the plugin ships a service at all: on every shell start it regenerates both
+  `LockView.qml` and `Service.qml` from the stock files installed at that
+  moment and compares them byte for byte with your clone, so a change to either
+  one — including a fix confined to the `Service.qml` PAM flow — or a hand edit
+  to the clone is reported. That is the notification you get after
+  `omarchy update`.
 - `uninstall` removes the clone outright only when nothing of yours would go
   with it — otherwise it restores the stock files and leaves your clone in place.
 
