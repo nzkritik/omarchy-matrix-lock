@@ -124,6 +124,12 @@ more care than a wallpaper would need.
 - Every read of a user-writable path goes through one bounded, no-follow,
   non-blocking helper, so a symlink is refused, a planted FIFO returns instead
   of wedging the process, and a swollen file cannot be pulled in whole.
+- The lock screen's own files, stock and cloned, are held to more than that:
+  a regular file of at most 1 MiB, read in full or not at all. An oversized,
+  unreadable or short-read `Service.qml` or `LockView.qml` is refused outright,
+  so `sync` never installs part of the PAM flow and `check` never calls a
+  truncated clone current. Both stock files are checked before the clone is
+  touched.
 - Every write is staged in the destination directory, `fsync`ed, and committed
   with an atomic rename, after refusing any destination that is a symlink or
   not a regular file.

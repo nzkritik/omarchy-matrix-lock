@@ -131,6 +131,50 @@ commit_tmp() { # <tmp> <dest>
 
 discard_tmp() { rm -f "$1" 2>/dev/null || true; }
 
+# For the lock screen's own files, stock and cloned. read_guarded's silent bound
+# is right for small state files but wrong here: a truncated Service.qml is a
+# broken PAM flow, and two reads truncated alike would still compare equal. So
+# this refuses rather than truncates. The file must be a regular file reached
+# without a symlink, at most 1MiB (the real ones are ~20KB), and read in full --
+# exactly as many bytes as fstat reported. Nothing is written to stdout until
+# all of that holds, so a caller never sees a prefix; failure is a non-zero
+# exit with the reason on stderr.
+READ_WHOLE_PY=$(cat <<'PYEOF'
+import os, stat, sys
+
+path, limit = sys.argv[1], int(sys.argv[2])
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError as e:
+    sys.exit("cannot open %s: %s" % (path, e.strerror))
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        sys.exit("not a regular file: %s" % path)
+    if st.st_size > limit:
+        sys.exit("refusing %s: %d bytes is over the %d-byte limit" % (path, st.st_size, limit))
+    chunks, total = [], 0
+    while total <= st.st_size:
+        b = os.read(fd, 65536)
+        if not b:
+            break
+        chunks.append(b)
+        total += len(b)
+    if total != st.st_size:
+        sys.exit("short or changing read of %s: got %d of %d bytes" % (path, total, st.st_size))
+except OSError as e:
+    sys.exit("cannot read %s: %s" % (path, e.strerror))
+finally:
+    os.close(fd)
+sys.stdout.buffer.write(b"".join(chunks))
+PYEOF
+)
+LOCK_FILE_LIMIT=1048576
+
+read_whole() { # <path>
+  python3 -c "$READ_WHOLE_PY" "$1" "$LOCK_FILE_LIMIT"
+}
+
 # --- clone identity ----------------------------------------------------------
 
 # From the password database, not $USER: the environment is mutable by the
@@ -222,12 +266,11 @@ sys.stdout.write(s)
 PYEOF
 )
 
-# The stock file is read here rather than opened by the patcher, so the bound
-# and the no-follow apply to it too. 1MB is ~50x the real file.
+# The stock file is read here rather than opened by the patcher, so the size
+# limit and the no-follow apply to it too. A refused read hands the patcher
+# nothing, which it rejects, so the pipeline fails as a whole.
 generate_lockview() {
-  [[ -f $STOCK_LOCKVIEW && ! -L $STOCK_LOCKVIEW ]] ||
-    fail "stock lock view is missing or not a regular file: $STOCK_LOCKVIEW"
-  read_guarded "$STOCK_LOCKVIEW" 4096 256 |
+  read_whole "$STOCK_LOCKVIEW" |
     RAIN_FILE="$RAIN_FILE" MARKER="$MARKER" python3 -c "$PATCH_PY"
 }
 
@@ -240,11 +283,7 @@ STAMP="$STATE_DIR/stock-lockview.sha256"
 # user has edited, which is refused.
 SERVICE_RECORD="$STATE_DIR/stock-service.sha256"
 
-read_stock_service() {
-  [[ -f $STOCK_SERVICE && ! -L $STOCK_SERVICE ]] ||
-    fail "stock lock service is missing or not a regular file: $STOCK_SERVICE"
-  read_guarded "$STOCK_SERVICE" 4096 256
-}
+read_stock_service() { read_whole "$STOCK_SERVICE"; }
 
 # True when the clone's Service.qml can be replaced without losing anything of
 # the user's: it is missing, identical to the current stock file, or identical
@@ -253,16 +292,25 @@ service_is_replaceable() {
   local f="$CLONE_DIR/Service.qml" recorded
   [[ -e $f || -L $f ]] || return 0
   [[ -f $f && ! -L $f ]] || return 1
-  cmp -s <(read_guarded "$f" 4096 256) <(read_stock_service) && return 0
+  local ours theirs
+  ours=$(read_whole "$f" | sha256sum | cut -d' ' -f1) || return 1
+  theirs=$(read_stock_service | sha256sum | cut -d' ' -f1) || return 1
+  [[ $ours == "$theirs" ]] && return 0
   recorded=$(read_guarded "$SERVICE_RECORD" 1 128 | head -n1)
-  [[ -n $recorded ]] || return 1
-  [[ $(read_guarded "$f" 4096 256 | sha256sum | cut -d' ' -f1) == "$recorded" ]]
+  [[ -n $recorded && $ours == "$recorded" ]]
 }
 
 require_stock() {
   [[ -d $STOCK_DIR ]] || fail "stock lock plugin not found at $STOCK_DIR (needs Omarchy 4+)"
   [[ -f $STOCK_LOCKVIEW ]] || fail "stock lock view not found at $STOCK_LOCKVIEW (needs Omarchy 4+)"
   [[ -f $STOCK_SERVICE ]] || fail "stock lock service not found at $STOCK_SERVICE (needs Omarchy 4+)"
+  # Both stock files must be usable before anything about the clone is judged
+  # or touched, so a problem with them is reported as what it is -- and never
+  # as advice to delete the clone's working Service.qml.
+  read_stock_service >/dev/null ||
+    fail "cannot use the stock lock service $STOCK_SERVICE; your lock screen was left as it is"
+  generate_lockview >/dev/null ||
+    fail "could not patch LockView.qml -- this Omarchy's lock screen differs from what this plugin expects, so your lock screen was left as it is. Please report it at github.com/nzkritik/omarchy-matrix-lock."
   local f
   for f in "${RAIN_FILES[@]}"; do
     [[ -f $PLUGIN_DIR/$f ]] || fail "$f missing from $PLUGIN_DIR"
@@ -339,10 +387,16 @@ clone_state() {
     [[ -f $CLONE_DIR/$f && ! -L $CLONE_DIR/$f ]] || return 3
   done
 
-  # A stock LockView this plugin can no longer patch generates nothing, which
-  # compares unequal: stale, and `sync` then says why.
-  cmp -s <(generate_lockview 2>/dev/null) <(read_guarded "$CLONE_DIR/LockView.qml" 4096 256) || return 3
-  cmp -s <(read_stock_service 2>/dev/null) <(read_guarded "$CLONE_DIR/Service.qml" 4096 256) || return 3
+  # Each side is produced in full or not at all, and a side that cannot be
+  # produced -- an oversized or unreadable file, or a stock LockView this
+  # plugin can no longer patch -- is stale outright, never compared: two
+  # failures would otherwise match as equal empty outputs. `sync` says why.
+  local want_view want_service have_view have_service
+  want_view=$(generate_lockview 2>/dev/null | sha256sum | cut -d' ' -f1) || return 3
+  want_service=$(read_stock_service 2>/dev/null | sha256sum | cut -d' ' -f1) || return 3
+  have_view=$(read_whole "$CLONE_DIR/LockView.qml" 2>/dev/null | sha256sum | cut -d' ' -f1) || return 3
+  have_service=$(read_whole "$CLONE_DIR/Service.qml" 2>/dev/null | sha256sum | cut -d' ' -f1) || return 3
+  [[ $want_view == "$have_view" && $want_service == "$have_service" ]] || return 3
 
   # A clone made by an older version of this plugin lacks some of these, which
   # reads as stale too -- and `sync` is exactly what brings it up to date.
@@ -406,7 +460,7 @@ cmd_uninstall() {
     require_real_dir "$CLONE_DIR"
     local tmp
     tmp=$(stage_tmp "$CLONE_DIR/LockView.qml")
-    if ! read_guarded "$STOCK_LOCKVIEW" 4096 256 >"$tmp"; then
+    if ! read_whole "$STOCK_LOCKVIEW" >"$tmp"; then
       discard_tmp "$tmp"
       fail "could not restore the stock LockView.qml"
     fi
