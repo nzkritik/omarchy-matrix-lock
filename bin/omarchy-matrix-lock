@@ -9,15 +9,24 @@
 # `omarchy plugin clone`, which copies omarchy.lock to <user>.lock and switches
 # the shell over to the copy.
 #
-# LockView.qml is regenerated from the *installed* stock file on every run, so
-# an install picks up whatever Omarchy currently ships rather than freezing a
-# copy taken when this script was written. Service.qml -- every line of the
-# password and fingerprint PAM flow -- is left exactly as cloned.
+# LockView.qml and Service.qml are regenerated from the *installed* stock files
+# on every run, so an install picks up whatever Omarchy currently ships rather
+# than freezing a copy taken when this script was written. Service.qml only
+# gains the two timings below; its password and fingerprint PAM flow is left
+# exactly as shipped.
 #
 #   install      clone omarchy.lock if needed, then draw the rain on it
 #   uninstall    put the stock lock screen back
-#   sync         regenerate the clone against the lock screen you have now
-#   status       report what is installed and what the lock will show
+#   sync         regenerate the clone against the lock screen you have now,
+#                and apply the current settings
+#   set <setting> <time>
+#                change a setting in shell.json and apply it. <time> is
+#                seconds, or 30s / 2m / 1h, or "off"
+#                  hide-fields  hide the password field after this long idle,
+#                               leaving only the rain (default off)
+#                  display-off  turn the display off after this long idle
+#                               (default 5s, as stock Omarchy)
+#   status       report what is installed and the settings in effect
 #   check        exit 0 if the clone is current, 3 if an update left it stale
 #   notice       used by the plugin: exit 0 once, the first time it finds the
 #                lock screen not set up, so it can say how; 1 otherwise
@@ -35,21 +44,25 @@ export PATH
 SELF=$(readlink -f "$0")
 PLUGIN_DIR=${SELF%/bin/*}
 PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+SHELL_JSON="$HOME/.config/omarchy/shell.json"
 
 # Fixed, root-owned installation root. Deliberately NOT $OMARCHY_PATH: this
-# names the file whose contents become the user's lock screen, so it must not
+# names the files whose contents become the user's lock screen, so it must not
 # be redirectable by the environment of whoever invokes the script.
 STOCK_ROOT="/usr/share/omarchy"
 STOCK_DIR="$STOCK_ROOT/shell/plugins/lock"
 STOCK_LOCKVIEW="$STOCK_DIR/LockView.qml"
+STOCK_SERVICE="$STOCK_DIR/Service.qml"
 
 SOURCE_ID="omarchy.lock"
+PLUGIN_ID="nzkritik.matrix-lock"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-matrix-lock"
 
-# Written into the generated LockView.qml so a later run can tell its own
-# output from a file the user has since edited by hand.
+# Written into the generated files so a later run can tell its own output from
+# a file the user has since edited by hand.
 MARKER="nzkritik.matrix-lock:lock"
+SERVICE_MARKER="nzkritik.matrix-lock:service"
 
 # Recognised as ours as well: clones generated while this feature still lived in
 # the nzkritik.matrix-rain plugin. The output was identical bar the marker
@@ -62,8 +75,11 @@ MARKER_RE='nzkritik\.(matrix-lock|matrix-rain):lock'
 # to the CPU one, so all of them travel together.
 RAIN_FILES=(MatrixRain.qml MatrixRainGpu.qml MatrixRainCpu.qml rain.frag.qsb)
 
-# Must match RAIN_FILE in the matrix-rain plugin's Service.qml.
-RAIN_FILE="zz-matrix-rain.png"
+# Settings, in seconds; 0 turns the behaviour off. The defaults reproduce the
+# stock lock screen: the field never hides and the display blanks after 5s.
+DEFAULT_HIDE_FIELDS=0
+DEFAULT_DISPLAY_OFF=5
+MAX_SECONDS=86400
 
 fail() {
   echo "omarchy-matrix-lock: $*" >&2
@@ -71,7 +87,7 @@ fail() {
 }
 
 usage() {
-  sed -n '3,25p' "$SELF" | sed 's|^# \?||'
+  sed -n '3,34p' "$SELF" | sed 's|^# \?||'
 }
 
 # --- untrusted-path discipline -----------------------------------------------
@@ -139,20 +155,152 @@ CLONE_USER=$(id -un)
 CLONE_ID="$CLONE_USER.lock"
 CLONE_DIR="$PLUGINS_DIR/$CLONE_ID"
 
-# --- the patch ---------------------------------------------------------------
+# --- settings ----------------------------------------------------------------
+#
+# Kept on this plugin's entry in shell.json, beside every other shell setting:
+#
+#   "plugins": [ { "id": "nzkritik.matrix-lock",
+#                  "hideFieldsAfter": 5, "displayOffAfter": 3600 } ]
+#
+# Omarchy hands a service plugin none of its shell.json entry, and the lock
+# should not be reading user files while it runs anyway, so the values are
+# written into the generated Service.qml by install/sync/set instead.
 
-# Applied to the stock LockView on stdin. Every anchor must match exactly once:
-# if Omarchy reworks LockView.qml the edit is refused outright rather than
-# half-applied to a lock screen.
-PATCH_PY=$(cat <<'PYEOF'
+# Dotfile managers (stow and friends) commonly make shell.json a symlink, and
+# the shell follows it, so this does too -- once, to a final path that must be
+# a regular file. Every read and write after that refuses links as usual. The
+# worst a planted link can do is point the two settings at another of the
+# user's own files, which yields defaults.
+shell_json_path() {
+  local p=$SHELL_JSON
+  [[ -L $p ]] && p=$(readlink -f "$p")
+  [[ -n $p && -f $p && ! -L $p ]] || return 1
+  printf '%s' "$p"
+}
+
+# 4MB is far beyond any real shell.json; the bound only stops a swollen file.
+read_shell_json() {
+  local p
+  if ! p=$(shell_json_path); then
+    [[ -e $SHELL_JSON || -L $SHELL_JSON ]] &&
+      echo "omarchy-matrix-lock: $SHELL_JSON is not a regular file; using the default settings" >&2
+    return 0
+  fi
+  read_guarded "$p" 4096 1024
+}
+
+# Prints "<hideFieldsAfter> <displayOffAfter>". A missing file, entry or key,
+# or anything that is not a whole number of seconds in range, reads as the
+# default: the lock screen must still generate from a broken shell.json.
+SETTINGS_PY=$(cat <<'PYEOF'
+import json, os, sys
+
+defaults = {"hideFieldsAfter": int(os.environ["DEFAULT_HIDE_FIELDS"]),
+            "displayOffAfter": int(os.environ["DEFAULT_DISPLAY_OFF"])}
+limit = int(os.environ["MAX_SECONDS"])
+entry = {}
+try:
+    cfg = json.loads(sys.stdin.read())
+    for p in cfg.get("plugins", []) if isinstance(cfg, dict) else []:
+        if isinstance(p, dict) and p.get("id") == os.environ["PLUGIN_ID"]:
+            entry = p
+            break
+except ValueError:
+    pass
+
+out = []
+for key, default in defaults.items():
+    v = entry.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= limit:
+        print("omarchy-matrix-lock: ignoring %s=%r in shell.json; using %d"
+              % (key, v, default), file=sys.stderr)
+        v = default
+    out.append(str(v))
+print(" ".join(out))
+PYEOF
+)
+
+read_settings() {
+  read_shell_json |
+    DEFAULT_HIDE_FIELDS=$DEFAULT_HIDE_FIELDS DEFAULT_DISPLAY_OFF=$DEFAULT_DISPLAY_OFF \
+      MAX_SECONDS=$MAX_SECONDS PLUGIN_ID=$PLUGIN_ID python3 -c "$SETTINGS_PY"
+}
+
+# "5", "30s", "2m", "1h" or "off" -> whole seconds.
+parse_duration() {
+  local v=${1,,} n
+  [[ $v == off || $v == never ]] && { echo 0; return; }
+  [[ $v =~ ^([0-9]{1,6})([smh]?)$ ]] || fail "not a duration: $1 (try 5, 30s, 2m, 1h or off)"
+  n=$((10#${BASH_REMATCH[1]}))
+  case ${BASH_REMATCH[2]} in
+  m) n=$((n * 60)) ;;
+  h) n=$((n * 3600)) ;;
+  esac
+  ((n <= MAX_SECONDS)) || fail "$1 is longer than 24h"
+  echo "$n"
+}
+
+describe_seconds() {
+  local s=$1
+  if ((s == 0)); then echo "off"
+  elif ((s % 3600 == 0)); then echo "$((s / 3600))h"
+  elif ((s % 60 == 0)); then echo "$((s / 60))m"
+  else echo "${s}s"
+  fi
+}
+
+# Rewrites shell.json with one key changed on this plugin's entry, adding the
+# entry if there is none. Same formatting as the shell's own writes
+# (JSON.stringify with two-space indent), so the diff is only the change.
+SET_PY=$(cat <<'PYEOF'
+import json, os, sys
+
+src = sys.stdin.read()
+cfg = json.loads(src) if src.strip() else {}
+if not isinstance(cfg, dict):
+    sys.exit("shell.json is not a JSON object")
+plugins = cfg.setdefault("plugins", [])
+if not isinstance(plugins, list):
+    sys.exit("shell.json 'plugins' is not a list")
+pid = os.environ["PLUGIN_ID"]
+for p in plugins:
+    if isinstance(p, dict) and p.get("id") == pid:
+        entry = p
+        break
+else:
+    entry = {"id": pid}
+    plugins.append(entry)
+entry[os.environ["KEY"]] = int(os.environ["VALUE"])
+sys.stdout.write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+PYEOF
+)
+
+write_setting() { # <key> <seconds>
+  local dest tmp
+  if [[ -e $SHELL_JSON || -L $SHELL_JSON ]]; then
+    dest=$(shell_json_path) || fail "refusing to write $SHELL_JSON: it is not a regular file"
+  else
+    dest=$SHELL_JSON
+  fi
+  tmp=$(stage_tmp "$dest")
+  if ! read_shell_json | KEY="$1" VALUE="$2" PLUGIN_ID="$PLUGIN_ID" python3 -c "$SET_PY" >"$tmp"; then
+    discard_tmp "$tmp"
+    fail "could not update $dest; is it valid JSON?"
+  fi
+  commit_tmp "$tmp" "$dest"
+}
+
+# --- the patches -------------------------------------------------------------
+
+# Both are applied to a stock file on stdin. Every anchor must match exactly
+# once: if Omarchy reworks the lock screen the edit is refused outright rather
+# than half-applied to it.
+PATCH_COMMON_PY=$(cat <<'PYEOF'
 import os, sys
 
 s = sys.stdin.read()
 if not s.strip():
-    sys.exit("stock LockView.qml was empty or unreadable")
-
-rain_file = os.environ["RAIN_FILE"]
-marker = os.environ["MARKER"]
+    sys.exit("stock file was empty or unreadable")
 
 
 def sub(old, new):
@@ -161,24 +309,27 @@ def sub(old, new):
         sys.exit("anchor matched %d times, expected 1:\n%s"
                  % (s.count(old), old.strip()[:120]))
     s = s.replace(old, new)
+PYEOF
+)
 
+LOCKVIEW_PY=$(cat <<'PYEOF'
+marker = os.environ["MARKER"]
 
 sub(
     "  property bool loadBackground: true\n",
     "  property bool loadBackground: true\n"
     "  // Generated by " + marker + " -- edits here are overwritten on sync.\n"
     "  //\n"
-    "  // The background picker can only list stills, so the rain is represented\n"
-    "  // on disk by a preview PNG under this name and drawn live wherever that\n"
-    "  // file is the selection. Matching the same name here is what keeps the\n"
-    "  // lock screen in step with the desktop with no separate setting, and what\n"
-    "  // leaves the stock blurred still in place for every other wallpaper. If\n"
-    "  // the rain plugin is removed this simply stays false.\n"
-    '  readonly property bool rainActive: String(backgroundPath).split("/").pop() === "'
-    + rain_file + '"\n',
+    "  // The rain replaces the blurred wallpaper on every lock screen, whatever\n"
+    "  // the desktop background is.\n"
+    "  readonly property bool rainActive: true\n"
+    "  // Raised by the service once the lock has sat untouched for the configured\n"
+    "  // time: the password field fades out and only the rain is left. The first\n"
+    "  // key press brings it back and is not typed into the field.\n"
+    "  property bool fieldsHidden: false\n",
 )
 
-# Nothing decodes or blurs the stand-in still while the rain covers it.
+# Nothing decodes or blurs the wallpaper while the rain covers it.
 sub(
     '      source: root.loadBackground ? root.fileUrl(root.backgroundPath) : ""',
     '      source: root.loadBackground && !root.rainActive ? root.fileUrl(root.backgroundPath) : ""',
@@ -193,8 +344,6 @@ sub(
 mouse = "    MouseArea {\n      anchors.fill: parent\n      hoverEnabled: true\n"
 sub(
     mouse,
-    "    // Loaded only while the rain is the selected background, so an ordinary\n"
-    "    // wallpaper leaves the lock screen bit-for-bit stock.\n"
     "    Loader {\n"
     "      id: rainLoader\n"
     "      anchors.fill: parent\n"
@@ -203,8 +352,8 @@ sub(
     "    }\n"
     "\n"
     "    // loadBackground is the lock's own \"is anyone looking at this\" flag --\n"
-    "    // root.locked when locked, previewVisible in the preview. Reusing it\n"
-    "    // stops the rain animating behind a display the idle timer has blanked.\n"
+    "    // root.locked when locked, previewVisible in the preview -- so the rain\n"
+    "    // stops the moment the lock or the preview goes away.\n"
     "    Binding {\n"
     "      target: rainLoader.item\n"
     '      property: "playing"\n'
@@ -216,23 +365,153 @@ sub(
     + mouse,
 )
 
+# Faded rather than made invisible: an invisible TextInput loses keyboard focus,
+# and the key that brings the field back has to land somewhere.
+sub(
+    "      id: inputField\n",
+    "      id: inputField\n"
+    "      opacity: root.fieldsHidden ? 0 : 1\n"
+    "      Behavior on opacity { NumberAnimation { duration: 400 } }\n",
+)
+
+# Keys handlers run before the TextInput sees the key, so accepting it here
+# keeps the waking key press out of the password.
+sub(
+    "        Keys.onPressed: function(event) {\n"
+    "          root.wakeRequested()\n",
+    "        Keys.onPressed: function(event) {\n"
+    "          if (root.fieldsHidden) {\n"
+    "            root.wakeRequested()\n"
+    "            event.accepted = true\n"
+    "            return\n"
+    "          }\n"
+    "          root.wakeRequested()\n",
+)
+
 sys.stdout.write(s)
 PYEOF
 )
 
-# The stock file is read here rather than opened by the patcher, so the bound
-# and the no-follow apply to it too. 1MB is ~50x the real file.
+SERVICE_PY=$(cat <<'PYEOF'
+marker = os.environ["SERVICE_MARKER"]
+hide = int(os.environ["HIDE_FIELDS"])
+off = int(os.environ["DISPLAY_OFF"])
+
+sub(
+    "  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating\n",
+    "  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating\n"
+    "\n"
+    "  // Generated by " + marker + " -- edits here are overwritten on sync.\n"
+    "  // settings: hideFieldsAfter=%d displayOffAfter=%d\n" % (hide, off)
+    + "  //\n"
+    "  // The only changes from the stock service are these two timings and the\n"
+    "  // state they drive; the password and fingerprint PAM flow is untouched.\n"
+    "  // Both count from the last input on the lock screen, and 0 turns either\n"
+    "  // one off. Change them with: omarchy-matrix-lock set\n"
+    "  readonly property int hideFieldsMs: %d\n" % (hide * 1000)
+    + "  readonly property int displayOffMs: %d\n" % (off * 1000)
+    + "  property bool fieldsHidden: false\n"
+    "\n"
+    "  function armFieldsTimer() {\n"
+    "    fieldsHidden = false\n"
+    "    if (hideFieldsMs > 0 && (lockRequested || previewVisible)) fieldsTimer.restart()\n"
+    "    else fieldsTimer.stop()\n"
+    "  }\n",
+)
+
+# Every path that restarts the blank countdown -- locking, any input, a failed
+# password -- restarts the hide countdown with it.
+sub(
+    "  function armBlankTimer() {\n"
+    "    idleBlankTimer.armedAt = Date.now()\n",
+    "  function armBlankTimer() {\n"
+    "    armFieldsTimer()\n"
+    "    if (displayOffMs <= 0) {\n"
+    "      idleBlankTimer.stop()\n"
+    "      return\n"
+    "    }\n"
+    "    idleBlankTimer.armedAt = Date.now()\n",
+)
+
+# Unlocking leaves the field showing for next time.
+sub(
+    "  function runWake() {\n"
+    "    if (!wakeProcess.running) wakeProcess.running = true\n",
+    "  function runWake() {\n"
+    "    if (!lockRequested) armFieldsTimer()\n"
+    "    if (!wakeProcess.running) wakeProcess.running = true\n",
+)
+
+sub(
+    "    id: idleBlankTimer\n"
+    "    interval: 5000\n",
+    "    id: idleBlankTimer\n"
+    "    interval: root.displayOffMs > 0 ? root.displayOffMs : 5000\n",
+)
+
+sub(
+    "  Timer {\n"
+    "    id: sessionLockStabilizeTimer\n",
+    "  Timer {\n"
+    "    id: fieldsTimer\n"
+    "    interval: Math.max(1, root.hideFieldsMs)\n"
+    "    repeat: false\n"
+    "    // Never while a password is being checked or has been part-typed.\n"
+    "    onTriggered: {\n"
+    "      if ((root.lockRequested || root.previewVisible) && !root.authenticatingPassword\n"
+    "          && root.enteredPassword.length === 0) root.fieldsHidden = true\n"
+    "    }\n"
+    "  }\n"
+    "\n"
+    "  Timer {\n"
+    "    id: sessionLockStabilizeTimer\n",
+)
+
+sub(
+    "        onWakeRequested: root.runWake()\n",
+    "        onWakeRequested: root.runWake()\n"
+    "        fieldsHidden: root.fieldsHidden\n",
+)
+
+# The preview runs the hide countdown too, so the setting can be seen without
+# locking the session.
+sub(
+    "      loadBackground: root.previewVisible\n",
+    "      loadBackground: root.previewVisible\n"
+    "      fieldsHidden: root.fieldsHidden\n",
+)
+sub(
+    "      root.previewVisible = true\n",
+    "      root.previewVisible = true\n"
+    "      root.armFieldsTimer()\n",
+)
+
+sys.stdout.write(s)
+PYEOF
+)
+
+# The stock files are read here rather than opened by the patcher, so the bound
+# and the no-follow apply to them too. 1MB is ~20x either real file.
+read_stock() { # <path>
+  [[ -f $1 && ! -L $1 ]] || fail "stock lock file is missing or not a regular file: $1"
+  read_guarded "$1" 4096 256
+}
+
 generate_lockview() {
-  [[ -f $STOCK_LOCKVIEW && ! -L $STOCK_LOCKVIEW ]] ||
-    fail "stock lock view is missing or not a regular file: $STOCK_LOCKVIEW"
-  read_guarded "$STOCK_LOCKVIEW" 4096 256 |
-    RAIN_FILE="$RAIN_FILE" MARKER="$MARKER" python3 -c "$PATCH_PY"
+  read_stock "$STOCK_LOCKVIEW" |
+    MARKER="$MARKER" python3 -c "$PATCH_COMMON_PY"$'\n'"$LOCKVIEW_PY"
+}
+
+generate_service() { # <hide-seconds> <off-seconds>
+  read_stock "$STOCK_SERVICE" |
+    SERVICE_MARKER="$SERVICE_MARKER" HIDE_FIELDS="$1" DISPLAY_OFF="$2" \
+      python3 -c "$PATCH_COMMON_PY"$'\n'"$SERVICE_PY"
 }
 
 # Identifies the stock lock screen this clone was generated from, so a later
 # Omarchy update can be noticed.
 stock_id() {
-  read_guarded "$STOCK_LOCKVIEW" 4096 256 | sha256sum | cut -d' ' -f1
+  { read_stock "$STOCK_LOCKVIEW"; read_stock "$STOCK_SERVICE"; } | sha256sum | cut -d' ' -f1
 }
 
 STAMP="$STATE_DIR/stock-lockview.sha256"
@@ -240,6 +519,7 @@ STAMP="$STATE_DIR/stock-lockview.sha256"
 require_stock() {
   [[ -d $STOCK_DIR ]] || fail "stock lock plugin not found at $STOCK_DIR (needs Omarchy 4+)"
   [[ -f $STOCK_LOCKVIEW ]] || fail "stock lock view not found at $STOCK_LOCKVIEW (needs Omarchy 4+)"
+  [[ -f $STOCK_SERVICE ]] || fail "stock lock service not found at $STOCK_SERVICE (needs Omarchy 4+)"
   local f
   for f in "${RAIN_FILES[@]}"; do
     [[ -f $PLUGIN_DIR/$f ]] || fail "$f missing from $PLUGIN_DIR"
@@ -252,28 +532,57 @@ clone_is_generated() {
   read_guarded "$CLONE_DIR/LockView.qml" 4096 256 | grep -qE "$MARKER_RE"
 }
 
-write_lockview() {
+# True when the clone's Service.qml is ours or still exactly as cloned -- a 1.2
+# clone left it stock -- so regenerating it loses nothing either.
+service_is_replaceable() {
+  local f="$CLONE_DIR/Service.qml"
+  [[ -e $f || -L $f ]] || return 0
+  [[ -f $f && ! -L $f ]] || return 1
+  read_guarded "$f" 4096 256 | grep -qF "$SERVICE_MARKER" && return 0
+  cmp -s "$f" "$STOCK_SERVICE"
+}
+
+# The settings baked into the clone's Service.qml, as "<hide> <off>", or
+# nothing when it has none.
+applied_settings() {
+  read_guarded "$CLONE_DIR/Service.qml" 4096 256 |
+    sed -nE 's|^  // settings: hideFieldsAfter=([0-9]+) displayOffAfter=([0-9]+)$|\1 \2|p' | head -n1
+}
+
+write_file() { # <dest> -- content on stdin
+  local tmp
+  tmp=$(stage_tmp "$1")
+  if ! cat >"$tmp"; then
+    discard_tmp "$tmp"
+    return 1
+  fi
+  commit_tmp "$tmp" "$1"
+}
+
+write_clone() {
   require_real_dir "$CLONE_DIR"
 
-  # Generated to a staged file rather than through $(...), which would eat the
-  # trailing newline, and so a failed generate leaves the existing lock screen
-  # untouched.
-  local tmp
-  tmp=$(stage_tmp "$CLONE_DIR/LockView.qml")
-  if ! generate_lockview >"$tmp"; then
-    discard_tmp "$tmp"
-    fail "could not patch LockView.qml -- this Omarchy's lock screen differs from what this plugin expects. Please report it at github.com/nzkritik/omarchy-matrix-lock."
+  local settings hide off
+  settings=$(read_settings) || fail "could not read the settings from $SHELL_JSON"
+  read -r hide off <<<"$settings"
+
+  # Both are generated before either is written, so a stock file this plugin
+  # cannot patch leaves the existing lock screen untouched rather than half
+  # updated. Staged files, not $(...), which would eat the trailing newline.
+  local view service
+  view=$(stage_tmp "$CLONE_DIR/LockView.qml")
+  service=$(stage_tmp "$CLONE_DIR/Service.qml")
+  if ! generate_lockview >"$view" || ! generate_service "$hide" "$off" >"$service"; then
+    discard_tmp "$view"
+    discard_tmp "$service"
+    fail "could not patch the lock screen -- this Omarchy's lock screen differs from what this plugin expects. Please report it at github.com/nzkritik/omarchy-matrix-lock."
   fi
-  commit_tmp "$tmp" "$CLONE_DIR/LockView.qml"
+  commit_tmp "$service" "$CLONE_DIR/Service.qml"
+  commit_tmp "$view" "$CLONE_DIR/LockView.qml"
 
   local f
   for f in "${RAIN_FILES[@]}"; do
-    tmp=$(stage_tmp "$CLONE_DIR/$f")
-    if ! cat "$PLUGIN_DIR/$f" >"$tmp"; then
-      discard_tmp "$tmp"
-      fail "could not copy $f into $CLONE_DIR"
-    fi
-    commit_tmp "$tmp" "$CLONE_DIR/$f"
+    write_file "$CLONE_DIR/$f" <"$PLUGIN_DIR/$f" || fail "could not copy $f into $CLONE_DIR"
   done
 
   write_stamp
@@ -299,8 +608,10 @@ clone_state() {
   recorded=$(read_guarded "$STAMP" 1 128 | head -n1)
   current=$(stock_id)
   [[ -n $recorded && $recorded == "$current" ]] || return 3
-  # A clone made by an older version of this plugin lacks some of these, which
-  # reads as stale too -- and `sync` is exactly what brings it up to date.
+  # A clone made by an older version of this plugin lacks some of these, or
+  # has a stock Service.qml, which reads as stale too -- and `sync` is exactly
+  # what brings it up to date.
+  read_guarded "$CLONE_DIR/Service.qml" 4096 256 | grep -qF "$SERVICE_MARKER" || return 3
   local f
   for f in "${RAIN_FILES[@]}"; do
     cmp -s "$CLONE_DIR/$f" "$PLUGIN_DIR/$f" || return 3
@@ -318,8 +629,10 @@ cmd_install() {
   elif ! clone_is_generated && ! cmp -s "$CLONE_DIR/LockView.qml" "$STOCK_LOCKVIEW"; then
     fail "$CLONE_DIR/LockView.qml has your own edits; back them up and delete the file to continue"
   fi
+  service_is_replaceable ||
+    fail "$CLONE_DIR/Service.qml has your own edits; back them up and delete the file to continue"
 
-  write_lockview
+  write_clone
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 
   echo "Matrix rain installed on the lock screen ($CLONE_ID)."
@@ -327,15 +640,44 @@ cmd_install() {
   echo "  omarchy-shell lock preview"
 }
 
-cmd_sync() {
+sync_clone() {
   require_stock
   [[ -d $CLONE_DIR ]] || fail "not installed; run: omarchy-matrix-lock install"
   clone_is_generated ||
     fail "$CLONE_DIR/LockView.qml was not generated by this plugin; refusing to overwrite it"
+  service_is_replaceable ||
+    fail "$CLONE_DIR/Service.qml has your own edits; refusing to overwrite it"
 
-  write_lockview
+  write_clone
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+}
+
+cmd_sync() {
+  sync_clone
   echo "Refreshed $CLONE_ID against the installed lock screen. Run 'omarchy restart shell'."
+}
+
+cmd_set() {
+  local name=${1:-} value=${2:-} key seconds
+  [[ -n $name && -n $value ]] || fail "usage: omarchy-matrix-lock set hide-fields|display-off <seconds|30s|2m|1h|off>"
+  case $name in
+  hide-fields) key=hideFieldsAfter ;;
+  display-off) key=displayOffAfter ;;
+  *) fail "unknown setting: $name (hide-fields or display-off)" ;;
+  esac
+  seconds=$(parse_duration "$value")
+
+  write_setting "$key" "$seconds"
+  echo "$name: $(describe_seconds "$seconds") (saved to shell.json)"
+
+  local state=0
+  clone_state || state=$?
+  if ((state == 1)); then
+    echo "The lock screen is not set up yet; it takes effect on: omarchy-matrix-lock install"
+    return 0
+  fi
+  sync_clone
+  echo "Run 'omarchy restart shell' to apply it."
 }
 
 cmd_uninstall() {
@@ -350,19 +692,18 @@ cmd_uninstall() {
   for f in "${RAIN_FILES[@]}"; do ours+=(! -name "$f"); done
   extra=$(find "$CLONE_DIR" -mindepth 1 -maxdepth 1 "${ours[@]}")
 
-  if [[ -z $extra ]] && cmp -s "$CLONE_DIR/Service.qml" "$STOCK_DIR/Service.qml"; then
+  if [[ -z $extra ]] && service_is_replaceable; then
     omarchy-plugin-remove "$CLONE_ID" --yes >/dev/null ||
       fail "could not remove $CLONE_ID"
     echo "Removed $CLONE_ID; the built-in lock screen is back."
   else
     require_real_dir "$CLONE_DIR"
-    local tmp
-    tmp=$(stage_tmp "$CLONE_DIR/LockView.qml")
-    if ! read_guarded "$STOCK_LOCKVIEW" 4096 256 >"$tmp"; then
-      discard_tmp "$tmp"
+    read_stock "$STOCK_LOCKVIEW" | write_file "$CLONE_DIR/LockView.qml" ||
       fail "could not restore the stock LockView.qml"
+    if service_is_replaceable; then
+      read_stock "$STOCK_SERVICE" | write_file "$CLONE_DIR/Service.qml" ||
+        fail "could not restore the stock Service.qml"
     fi
-    commit_tmp "$tmp" "$CLONE_DIR/LockView.qml"
     for f in "${RAIN_FILES[@]}"; do rm -f "$CLONE_DIR/$f"; done
     omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
     echo "Reverted the rain from $CLONE_ID and kept your other changes to it."
@@ -376,23 +717,25 @@ cmd_status() {
   clone_state || state=$?
 
   case $state in
-  0) echo "lock rain:  installed on $CLONE_ID" ;;
-  3) echo "lock rain:  installed on $CLONE_ID (stale -- run: omarchy-matrix-lock sync)" ;;
+  0) echo "lock rain:    installed on $CLONE_ID" ;;
+  3) echo "lock rain:    installed on $CLONE_ID (stale -- run: omarchy-matrix-lock sync)" ;;
   *)
     if [[ ! -d $CLONE_DIR ]]; then
-      echo "lock rain:  not installed"
+      echo "lock rain:    not installed"
     else
-      echo "lock rain:  $CLONE_ID exists but was not set up by this plugin"
+      echo "lock rain:    $CLONE_ID exists but was not set up by this plugin"
     fi
     ;;
   esac
 
-  local current
-  current=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null || true)
-  if [[ ${current##*/} == "$RAIN_FILE" ]]; then
-    echo "background: matrix rain selected, so the lock screen shows it"
-  else
-    echo "background: ${current##*/} -- the lock screen shows the stock blurred still"
+  local hide off applied
+  read -r hide off <<<"$(read_settings)"
+  echo "hide-fields:  $(describe_seconds "$hide")"
+  echo "display-off:  $(describe_seconds "$off")"
+  if ((state != 1)); then
+    applied=$(applied_settings)
+    [[ $applied == "$hide $off" ]] ||
+      echo "              (shell.json differs from the lock screen -- run: omarchy-matrix-lock sync)"
   fi
 }
 
@@ -424,6 +767,7 @@ case "${1:-}" in
 install) cmd_install ;;
 uninstall | remove) cmd_uninstall ;;
 sync) cmd_sync ;;
+set) shift; cmd_set "$@" ;;
 status) cmd_status ;;
 check) cmd_check ;;
 notice) cmd_notice ;;

@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "nzkritik.matrix-lock",
   "name": "Matrix Lock",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "nzkritik",
-  "description": "Draws the matrix rain on the Omarchy lock screen, and tells you when an Omarchy update has left the clone stale.",
+  "description": "Draws the matrix rain on the Omarchy lock screen, can hide the password field after a set time for a rain-only screensaver, and tells you when an Omarchy update has left the clone stale.",
   "kinds": [
     "service"
   ],

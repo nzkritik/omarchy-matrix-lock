@@ -8,25 +8,43 @@ Omarchy update has left it out of date.
 
 Preview it without locking yourself out with `omarchy-shell lock preview`.
 
-## Requires Matrix Rain as your wallpaper
+The rain replaces the blurred wallpaper on every lock, in your theme's accent
+colour, whatever your desktop background is. It pairs well with
+[Matrix Rain](https://github.com/nzkritik/omarchy-matrix-rain) on the desktop,
+but does not need it.
 
-This plugin is a companion to
-[Matrix Rain](https://github.com/nzkritik/omarchy-matrix-rain), and the lock
-screen follows your desktop:
+## Settings
 
-| Your wallpaper | The lock screen shows |
-| --- | --- |
-| Matrix Rain | the rain, in your theme's accent colour |
-| anything else | Omarchy's stock blurred wallpaper, unchanged |
+Two timings, both counted from the last key press or mouse movement on the
+lock screen. The defaults behave exactly like stock Omarchy.
 
-So install Matrix Rain and pick it in the background picker (Style ›
-Background), or the lock screen will look exactly as it does without this
-plugin. `omarchy-matrix-lock status` tells you which of the two the lock will
-show right now.
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `hide-fields` | off | Fade the password field out after this long, leaving only the rain. The first key press brings it back and is not typed into the field. |
+| `display-off` | 5s | Turn the display off after this long. `off` keeps it on until you unlock. |
 
-Stock Omarchy has no separate setting for the lock screen. It takes its colours
-from your theme and its background from your wallpaper, and following the
-wallpaper keeps it that way.
+```bash
+omarchy-matrix-lock set hide-fields 5s     # a rain-only screensaver after 5 seconds
+omarchy-matrix-lock set display-off 1h     # and the display off after an hour
+omarchy restart shell
+```
+
+Times are seconds, or `30s`, `2m`, `1h`, or `off`, up to 24 hours. They are
+stored on this plugin's entry in `~/.config/omarchy/shell.json`, so they travel
+with the rest of your shell settings:
+
+```json
+{ "id": "nzkritik.matrix-lock", "hideFieldsAfter": 5, "displayOffAfter": 3600 }
+```
+
+If you edit that by hand, run `omarchy-matrix-lock sync` and restart the shell.
+Omarchy does not pass a service plugin its `shell.json` entry, and the lock
+screen should not read your files while it runs anyway, so the values are
+written into the generated lock screen instead. `omarchy-matrix-lock status`
+says when the two disagree.
+
+`omarchy-shell lock preview` runs the `hide-fields` countdown too, so you can
+see it without locking.
 
 ## Install
 
@@ -37,21 +55,22 @@ omarchy-matrix-lock install
 omarchy restart shell
 ```
 
-Then select Matrix Rain as your wallpaper (see above).
-
 Adding the plugin changes nothing by itself: your lock screen is only cloned
 and patched when you run `install`. If you add it and skip that step, it tells
 you once, in a notification with the exact command, and never again.
 
 ```bash
-omarchy-matrix-lock status      # what is installed, and what the lock will show
+omarchy-matrix-lock status      # what is installed, and the settings in effect
+omarchy-matrix-lock set …       # change a setting (see above)
 omarchy-matrix-lock sync        # after an Omarchy update, or after updating this plugin
 omarchy-matrix-lock uninstall   # put the stock lock screen back
 omarchy-matrix-lock check       # quiet; exit 0 current, 3 stale, 1 not installed
 ```
 
-**Upgrading from 1.0:** run `omarchy-matrix-lock sync` after updating (the
-plugin reminds you), because the clone needs the new renderer files copied in.
+**Upgrading from 1.2 or earlier:** run `omarchy-matrix-lock sync` after
+updating (the plugin reminds you). From 1.3 the rain shows on every lock, not
+only while Matrix Rain is your wallpaper, and the clone's `Service.qml` is
+generated too, to carry the settings.
 
 ## GPU rendering, with a CPU fallback
 
@@ -74,9 +93,7 @@ it byte for byte, so anyone can check the binary matches the source.
 
 The renderer is self-contained: the `MatrixRain*.qml` files and the shader ship
 here and are copied into the clone, rather than loaded from the Matrix Rain
-plugin. Matrix Rain decides *whether* the lock shows rain, never *how* it is
-drawn, so updating or removing it can never break your lock screen. Without it,
-the lock screen just stays stock.
+plugin, so updating or removing that plugin can never break your lock screen.
 
 ## What it does to your system
 
@@ -86,30 +103,40 @@ through it, and the rain has to be drawn inside the lock screen's own QML. The
 supported way to change a built-in plugin is `omarchy plugin clone`, so
 `install` clones `omarchy.lock` to `<user>.lock` and patches the clone.
 
-`LockView.qml` is regenerated from the lock screen **you have installed** each
-time you run `install` or `sync`, rather than shipping a frozen copy, and every
-patch anchor must match exactly once or the edit is refused rather than
-half-applied. `Service.qml` — the whole password and fingerprint PAM flow — is
-left exactly as cloned.
+`LockView.qml` and `Service.qml` are regenerated from the lock screen **you
+have installed** each time you run `install`, `sync` or `set`, rather than
+shipping frozen copies, and every patch anchor must match exactly once or the
+edit is refused rather than half-applied. Both files are generated before
+either is written, so a refusal leaves your current lock screen as it was.
+
+`Service.qml` holds the password and fingerprint PAM flow, and none of that is
+touched: the patch only replaces the fixed 5-second display-off delay with the
+`display-off` setting, and adds the `hide-fields` countdown beside it. A
+`Service.qml` you have edited yourself is refused, not overwritten.
 
 Two things to know before you install it:
 
 - **The clone stops tracking upstream.** Your lock screen will not pick up fixes
   to `omarchy.lock`, security ones included, until you run `sync`. This is why
-  the plugin ships a service at all: it records which stock `LockView.qml` the
-  clone was generated from, and notifies you on the next shell start after that
-  file changes. That is the notification you get after `omarchy update`.
+  the plugin ships a service at all: it records which stock lock screen the
+  clone was generated from, and notifies you on the next shell start after it
+  changes. That is the notification you get after `omarchy update`.
 - `uninstall` removes the clone outright only when nothing of yours would go
-  with it — otherwise it restores `LockView.qml` and leaves your clone in place.
+  with it — otherwise it restores the stock files and leaves your clone in place.
 
 ## Handling untrusted paths
 
 The output of this script becomes a lock screen, so the paths it touches get
 more care than a wallpaper would need.
 
-- The stock `LockView.qml` is resolved from a fixed `/usr/share/omarchy`, never
-  from `$OMARCHY_PATH` — the environment must not be able to redirect the file
+- The stock lock files are resolved from a fixed `/usr/share/omarchy`, never
+  from `$OMARCHY_PATH` — the environment must not be able to redirect the files
   whose contents become your lock screen.
+- The settings read from `shell.json` must be whole numbers from 0 to 86400;
+  anything else falls back to the default, and they are written into the lock
+  screen as integer literals, never as text. A `shell.json` symlink (from a
+  dotfile manager) is resolved once to a regular file, and read and written
+  there under the rules below.
 - Every tool is resolved from `/usr/share/omarchy/bin` and `/usr/bin` only.
   The script pins `PATH` to those two root-owned directories, and the plugin
   starts it with that `PATH`, by full path, and without `BASH_ENV`, so nothing
