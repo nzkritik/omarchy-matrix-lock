@@ -12,7 +12,8 @@
 # LockView.qml is regenerated from the *installed* stock file on every run, so
 # an install picks up whatever Omarchy currently ships rather than freezing a
 # copy taken when this script was written. Service.qml -- every line of the
-# password and fingerprint PAM flow -- is left exactly as cloned.
+# password and fingerprint PAM flow -- is never patched: the clone keeps a
+# verbatim copy of the stock file, which sync refreshes when Omarchy updates it.
 #
 #   install      clone omarchy.lock if needed, then draw the rain on it
 #   uninstall    put the stock lock screen back
@@ -42,6 +43,7 @@ PLUGINS_DIR="$HOME/.config/omarchy/plugins"
 STOCK_ROOT="/usr/share/omarchy"
 STOCK_DIR="$STOCK_ROOT/shell/plugins/lock"
 STOCK_LOCKVIEW="$STOCK_DIR/LockView.qml"
+STOCK_SERVICE="$STOCK_DIR/Service.qml"
 
 SOURCE_ID="omarchy.lock"
 
@@ -229,17 +231,38 @@ generate_lockview() {
     RAIN_FILE="$RAIN_FILE" MARKER="$MARKER" python3 -c "$PATCH_PY"
 }
 
-# Identifies the stock lock screen this clone was generated from, so a later
-# Omarchy update can be noticed.
-stock_id() {
-  read_guarded "$STOCK_LOCKVIEW" 4096 256 | sha256sum | cut -d' ' -f1
+# Left by 1.2.0, which recorded a hash of the stock LockView.qml alone.
+# Nothing reads it now; uninstall still removes it.
+STAMP="$STATE_DIR/stock-lockview.sha256"
+
+# The hash of the stock Service.qml last copied into the clone. It is how sync
+# tells a copy that Omarchy has since updated -- safe to replace -- from one the
+# user has edited, which is refused.
+SERVICE_RECORD="$STATE_DIR/stock-service.sha256"
+
+read_stock_service() {
+  [[ -f $STOCK_SERVICE && ! -L $STOCK_SERVICE ]] ||
+    fail "stock lock service is missing or not a regular file: $STOCK_SERVICE"
+  read_guarded "$STOCK_SERVICE" 4096 256
 }
 
-STAMP="$STATE_DIR/stock-lockview.sha256"
+# True when the clone's Service.qml can be replaced without losing anything of
+# the user's: it is missing, identical to the current stock file, or identical
+# to the stock file this script last put there.
+service_is_replaceable() {
+  local f="$CLONE_DIR/Service.qml" recorded
+  [[ -e $f || -L $f ]] || return 0
+  [[ -f $f && ! -L $f ]] || return 1
+  cmp -s <(read_guarded "$f" 4096 256) <(read_stock_service) && return 0
+  recorded=$(read_guarded "$SERVICE_RECORD" 1 128 | head -n1)
+  [[ -n $recorded ]] || return 1
+  [[ $(read_guarded "$f" 4096 256 | sha256sum | cut -d' ' -f1) == "$recorded" ]]
+}
 
 require_stock() {
   [[ -d $STOCK_DIR ]] || fail "stock lock plugin not found at $STOCK_DIR (needs Omarchy 4+)"
   [[ -f $STOCK_LOCKVIEW ]] || fail "stock lock view not found at $STOCK_LOCKVIEW (needs Omarchy 4+)"
+  [[ -f $STOCK_SERVICE ]] || fail "stock lock service not found at $STOCK_SERVICE (needs Omarchy 4+)"
   local f
   for f in "${RAIN_FILES[@]}"; do
     [[ -f $PLUGIN_DIR/$f ]] || fail "$f missing from $PLUGIN_DIR"
@@ -276,32 +299,53 @@ write_lockview() {
     commit_tmp "$tmp" "$CLONE_DIR/$f"
   done
 
-  write_stamp
+  write_service
 }
 
-write_stamp() {
+# Refreshes the clone's verbatim copy of the stock Service.qml. Callers check
+# service_is_replaceable first.
+write_service() {
+  local tmp
+  tmp=$(stage_tmp "$CLONE_DIR/Service.qml")
+  if ! read_stock_service >"$tmp"; then
+    discard_tmp "$tmp"
+    fail "could not copy the stock Service.qml into $CLONE_DIR"
+  fi
+  commit_tmp "$tmp" "$CLONE_DIR/Service.qml"
+
   mkdir -p "$STATE_DIR"
   require_real_dir "$STATE_DIR"
-  local tmp
-  tmp=$(stage_tmp "$STAMP")
-  if ! stock_id >"$tmp"; then
+  tmp=$(stage_tmp "$SERVICE_RECORD")
+  if ! read_stock_service | sha256sum | cut -d' ' -f1 >"$tmp"; then
     discard_tmp "$tmp"
-    fail "could not record the stock lock screen version"
+    fail "could not record the stock Service.qml"
   fi
-  commit_tmp "$tmp" "$STAMP"
+  commit_tmp "$tmp" "$SERVICE_RECORD"
 }
 
 # 0 current, 3 stale, 1 not installed.
+#
+# Current means byte-identical to what `sync` would write right now: the
+# LockView.qml regenerated from the stock file installed at this moment, and a
+# verbatim copy of the stock Service.qml, which holds the PAM flow. So an
+# Omarchy update to either stock file, a hand edit, or a half-finished sync all
+# read as stale. Nothing recorded between runs is trusted for this.
 clone_state() {
   [[ -d $CLONE_DIR ]] || return 1
   clone_is_generated || return 1
-  local recorded current
-  recorded=$(read_guarded "$STAMP" 1 128 | head -n1)
-  current=$(stock_id)
-  [[ -n $recorded && $recorded == "$current" ]] || return 3
+
+  local f
+  for f in LockView.qml Service.qml; do
+    [[ -f $CLONE_DIR/$f && ! -L $CLONE_DIR/$f ]] || return 3
+  done
+
+  # A stock LockView this plugin can no longer patch generates nothing, which
+  # compares unequal: stale, and `sync` then says why.
+  cmp -s <(generate_lockview 2>/dev/null) <(read_guarded "$CLONE_DIR/LockView.qml" 4096 256) || return 3
+  cmp -s <(read_stock_service 2>/dev/null) <(read_guarded "$CLONE_DIR/Service.qml" 4096 256) || return 3
+
   # A clone made by an older version of this plugin lacks some of these, which
   # reads as stale too -- and `sync` is exactly what brings it up to date.
-  local f
   for f in "${RAIN_FILES[@]}"; do
     cmp -s "$CLONE_DIR/$f" "$PLUGIN_DIR/$f" || return 3
   done
@@ -318,6 +362,8 @@ cmd_install() {
   elif ! clone_is_generated && ! cmp -s "$CLONE_DIR/LockView.qml" "$STOCK_LOCKVIEW"; then
     fail "$CLONE_DIR/LockView.qml has your own edits; back them up and delete the file to continue"
   fi
+  service_is_replaceable ||
+    fail "$CLONE_DIR/Service.qml differs from the stock lock service; if you have not edited it, delete it and run this again"
 
   write_lockview
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
@@ -332,6 +378,8 @@ cmd_sync() {
   [[ -d $CLONE_DIR ]] || fail "not installed; run: omarchy-matrix-lock install"
   clone_is_generated ||
     fail "$CLONE_DIR/LockView.qml was not generated by this plugin; refusing to overwrite it"
+  service_is_replaceable ||
+    fail "$CLONE_DIR/Service.qml differs from the stock lock service; if you have not edited it, delete it and run sync again"
 
   write_lockview
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
@@ -350,7 +398,7 @@ cmd_uninstall() {
   for f in "${RAIN_FILES[@]}"; do ours+=(! -name "$f"); done
   extra=$(find "$CLONE_DIR" -mindepth 1 -maxdepth 1 "${ours[@]}")
 
-  if [[ -z $extra ]] && cmp -s "$CLONE_DIR/Service.qml" "$STOCK_DIR/Service.qml"; then
+  if [[ -z $extra ]] && service_is_replaceable; then
     omarchy-plugin-remove "$CLONE_ID" --yes >/dev/null ||
       fail "could not remove $CLONE_ID"
     echo "Removed $CLONE_ID; the built-in lock screen is back."
@@ -367,7 +415,7 @@ cmd_uninstall() {
     omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
     echo "Reverted the rain from $CLONE_ID and kept your other changes to it."
   fi
-  rm -f "$STAMP" 2>/dev/null || true
+  rm -f "$STAMP" "$SERVICE_RECORD" 2>/dev/null || true
   echo "Run 'omarchy restart shell' to apply."
 }
 

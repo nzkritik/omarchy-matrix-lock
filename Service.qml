@@ -9,8 +9,8 @@
 //
 // A clone stops tracking upstream. Left alone it silently keeps an old lock
 // screen, security fixes included, which is the one real hazard of the whole
-// approach. `check` compares the stock LockView.qml this clone was generated
-// from against the one installed now; the shell restarts on update, so a stale
+// approach. `check` compares the clone with what `sync` would write from the
+// stock lock files installed now; the shell restarts on update, so a stale
 // clone is reported at exactly the moment it becomes stale.
 //
 // Nothing here writes anything except, once, the marker that the setup hint was

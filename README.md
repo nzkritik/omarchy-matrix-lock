@@ -90,15 +90,20 @@ supported way to change a built-in plugin is `omarchy plugin clone`, so
 time you run `install` or `sync`, rather than shipping a frozen copy, and every
 patch anchor must match exactly once or the edit is refused rather than
 half-applied. `Service.qml` — the whole password and fingerprint PAM flow — is
-left exactly as cloned.
+never patched: the clone keeps a verbatim copy of the stock file, and `sync`
+refreshes it when Omarchy updates it. `sync` only replaces a copy that matches
+the stock file it last put there; a `Service.qml` you have edited is refused.
 
 Two things to know before you install it:
 
 - **The clone stops tracking upstream.** Your lock screen will not pick up fixes
   to `omarchy.lock`, security ones included, until you run `sync`. This is why
-  the plugin ships a service at all: it records which stock `LockView.qml` the
-  clone was generated from, and notifies you on the next shell start after that
-  file changes. That is the notification you get after `omarchy update`.
+  the plugin ships a service at all: on every shell start it compares your
+  clone byte for byte with what `sync` would write now — the `LockView.qml`
+  regenerated from the installed stock file, and the stock `Service.qml` itself
+  — so a change to either one, including a fix confined to the PAM flow, or a
+  hand edit to the clone is reported. That is the notification you get after
+  `omarchy update`.
 - `uninstall` removes the clone outright only when nothing of yours would go
   with it — otherwise it restores `LockView.qml` and leaves your clone in place.
 
@@ -107,8 +112,8 @@ Two things to know before you install it:
 The output of this script becomes a lock screen, so the paths it touches get
 more care than a wallpaper would need.
 
-- The stock `LockView.qml` is resolved from a fixed `/usr/share/omarchy`, never
-  from `$OMARCHY_PATH` — the environment must not be able to redirect the file
+- The stock lock files are resolved from a fixed `/usr/share/omarchy`, never
+  from `$OMARCHY_PATH` — the environment must not be able to redirect the files
   whose contents become your lock screen.
 - Every tool is resolved from `/usr/share/omarchy/bin` and `/usr/bin` only.
   The script pins `PATH` to those two root-owned directories, and the plugin
