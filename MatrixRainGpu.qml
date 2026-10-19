@@ -15,6 +15,7 @@
 import QtQuick
 import QtQuick.Window
 import qs.Commons
+import qs.Commons as Commons
 
 Item {
   id: rain
@@ -37,10 +38,10 @@ Item {
   readonly property string alphabet: "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789"
 
   // Near-white head, theme-coloured body, and a tail falling away to black.
-  readonly property color headColor: blend(Color.accent, 0.78, 1.0)
-  readonly property color bodyColor: Color.accent
-  readonly property color midColor: blend(Color.accent, 0.38, 0.0)
-  readonly property color tailColor: blend(Color.accent, 0.70, 0.0)
+  readonly property color headColor: blend(Commons.Color.accent, 0.78, 1.0)
+  readonly property color bodyColor: Commons.Color.accent
+  readonly property color midColor: blend(Commons.Color.accent, 0.38, 0.0)
+  readonly property color tailColor: blend(Commons.Color.accent, 0.70, 0.0)
 
   function blend(c, pct, target) {
     return Qt.rgba(c.r + (target - c.r) * pct, c.g + (target - c.g) * pct, c.b + (target - c.b) * pct, 1.0)
@@ -119,7 +120,7 @@ Item {
     property real minTrail: rain.minTrail
     property real maxTrail: rain.maxTrail
     property real churn: rain.churn
-    property color background: Color.background
+    property color background: Commons.Color.background
     property color headColor: rain.headColor
     property color bodyColor: rain.bodyColor
     property color midColor: rain.midColor

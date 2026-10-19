@@ -8,6 +8,7 @@
 
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 Item {
   id: rain
@@ -64,10 +65,10 @@ Item {
 
   // The screensaver's gradient: near-white head, theme-coloured body, and a
   // tail that falls away toward black.
-  readonly property color headColor: rain.blend(Color.accent, 0.78, 1.0)
-  readonly property color bodyColor: Color.accent
-  readonly property color midColor: rain.blend(Color.accent, 0.38, 0.0)
-  readonly property color tailColor: rain.blend(Color.accent, 0.70, 0.0)
+  readonly property color headColor: rain.blend(Commons.Color.accent, 0.78, 1.0)
+  readonly property color bodyColor: Commons.Color.accent
+  readonly property color midColor: rain.blend(Commons.Color.accent, 0.38, 0.0)
+  readonly property color tailColor: rain.blend(Commons.Color.accent, 0.70, 0.0)
 
   function blend(c, pct, target) {
     return Qt.rgba(c.r + (target - c.r) * pct,
@@ -94,7 +95,7 @@ Item {
 
   Rectangle {
     anchors.fill: parent
-    color: Color.background
+    color: Commons.Color.background
   }
 
   Repeater {
