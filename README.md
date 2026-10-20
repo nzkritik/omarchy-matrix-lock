@@ -70,7 +70,13 @@ back is logged once to the journal as
 
 Qt 6 only loads precompiled shaders, so `rain.frag.qsb` (`rain.frag` built by
 Qt's `qsb`) is committed alongside its source. `tools/build-shaders.sh` rebuilds
-it byte for byte, so anyone can check the binary matches the source.
+it byte for byte, so anyone can check the binary matches the source. CI does
+that on every push with a pinned `qsb`, fails on any difference, and on `main`
+signs a build-provenance attestation for the rebuilt bytes:
+
+```bash
+gh attestation verify rain.frag.qsb --repo nzkritik/omarchy-matrix-lock
+```
 
 The renderer is self-contained: the `MatrixRain*.qml` files and the shader ship
 here and are copied into the clone, rather than loaded from the Matrix Rain
